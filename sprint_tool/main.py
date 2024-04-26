@@ -5,7 +5,9 @@ from datetime import datetime, timedelta
 import ast
 import copy
 import os
-
+import sys
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def run():
     args = parse_args()
@@ -20,12 +22,17 @@ def run():
                                      args.jira_password))
 
     if args.roll_sprints:
-        # Get lists of the current open sprints and the future sprints for this
-        # board.
+
         current_sprints = get_current_sprints(jira_agile_instance,
                                               args.jira_board)
+
+        # Get lists of the current open sprints and the future sprints for this
+        # board.
+
         future_sprints = get_future_sprints(jira_agile_instance,
                                             args.jira_board)
+        if len(future_sprints) == 0:
+            raise LookupError("No future sprints found")
 
         # Get the ids of the sprints we will want to close and start
         current_sprint_id = find_current_sprint_id(current_sprints,
@@ -39,18 +46,26 @@ def run():
         issue_keys = get_unfinished_issue_keys(jira_agile_instance,
                                                args.jira_board,
                                                current_sprint_id)
-        create_new_sprint(jira_agile_instance,
-                          args.jira_board,
-                          new_sprint_name)
-        close_current_sprint(jira_agile_instance,
-                             args.jira_board,
-                             current_sprint_id)
-        start_next_sprint(jira_agile_instance,
-                          args.jira_board,
-                          next_sprint_id)
-        move_issues_to_next_sprint(jira_agile_instance,
-                                   next_sprint_id,
-                                   issue_keys)
+
+        if can_sprint_roll_over(current_sprints[-1]) or args.force:
+
+            create_new_sprint(jira_agile_instance,
+                              args.jira_board,
+                              new_sprint_name)
+            close_current_sprint(jira_agile_instance,
+                                 args.jira_board,
+                                 current_sprint_id)
+            start_next_sprint(jira_agile_instance,
+                              args.jira_board,
+                              next_sprint_id)
+            move_issues_to_next_sprint(jira_agile_instance,
+                                       next_sprint_id,
+                                       issue_keys)
+            
+            print("Yay, the sprint rolled over!!")
+        else:
+            print("Won't roll over the sprint since it's not the time. You can force it by using --force.")
+
     elif args.report:
         report(jira_agile_instance, args.sprint_name, args.jira_board,
                 args.template, args.output)
@@ -58,9 +73,10 @@ def run():
         if not args.project_id or not args.epic_id or not \
                 (args.role or args.assignees):
             print("To copy an epic you must input project, epic and role")
+            sys.exit()
         copy_epic_to_task(jira_agile_instance, args.project_id, args.epic_id,
                           args.role, args.watchers, args.assignees,
-                          args.labels)
+                          args.labels, args.prefixes)
     elif args.ticket_comment:
         comment_by_query(jira_agile_instance, args.ticket_comment_query,
                          args.ticket_comment, args.ticket_comment_manager_cc,
@@ -127,9 +143,11 @@ def comment_by_query(jira_instance, query, comment, cc_to_manager,
 
 
 def copy_epic_to_task(jira_instance, project_id, epic_id, copy_to_role,
-                      watchers, assignees, labels):
+                      watchers, assignees, labels, prefixes):
     """copies an epic into tasks assigned to all the users in a specified role
-       or to the specified list of assignees. Assignees has higher priority"""
+       or to the specified list of assignees. Assignees has higher priority.
+       If there are prefixes, unique is prefix + summary, which allows the
+       same assignee multiple tickets. Else, it is one ticket per person"""
 
     print('Copy epic to tasks')
     print(epic_id)
@@ -141,6 +159,27 @@ def copy_epic_to_task(jira_instance, project_id, epic_id, copy_to_role,
             return [{f: getattr(val, f)} for val in field]
         else:
             return {f: getattr(field, f)}
+
+    # if a role is passed in, get role users and put in assignee list.
+    if not assignees:
+        role_id = jira_instance.project_roles(project_id)[copy_to_role]["id"]
+        actors = jira_instance.project_role(project_id, role_id).actors
+        assignees = [actor.name for actor in actors]
+    # verify that there is one user per prefix and that all expected assignees
+    # have a prefix
+    if prefixes:
+        prefix_set = set([prefixes[prefix][0] for prefix in prefixes])
+        if set(assignees) != prefix_set:
+            print("prefixes are unique and can only have one assignee")
+            print("These users are assignees with no prefixes: %s" % \
+                (set(assignees).difference(prefix_set)))
+            print("These users have prefixes but are not assignees: %s" % \
+                (prefix_set.difference(set(assignees))))
+            sys.exit()
+        for prefix in prefixes:
+            if len(prefixes[prefix]) != 1:
+                print("If you use prefixes, they are unique per user")
+                sys.exit()
 
     # find custom field names to get epic field
     custom_map = {fld['name']: fld['id'] for fld in jira_instance.fields()}
@@ -157,33 +196,34 @@ def copy_epic_to_task(jira_instance, project_id, epic_id, copy_to_role,
                  "reporter": get_values(epic.fields.reporter, "name"),
                  "duedate": epic.fields.duedate}
     # gets the list of tasks already assigned to the epic to prevent dups
-    existing = [issue.fields.assignee.name for issue in
+    # unique is either summary, if prefixes, or assignee
+    # max results defaults to 50, we set 100 as we are currently well below.
+    existing = [issue.fields.summary if prefixes
+                else issue.fields.assignee.name for issue in
                 jira_instance.search_issues(
                     'project=%s and issueType=Task and "Epic Link"=%s' %
-                    (project_id, epic_id))]
+                    (project_id, epic_id), maxResults=100)]
     task_fields = []
-    if not assignees:
-        role_id = jira_instance.project_roles(project_id)[copy_to_role]["id"]
-        actors = jira_instance.project_role(project_id, role_id).actors
-        for actor in actors:
-            if actor.name not in existing:
-                fields = copy.deepcopy(epic_flds)
-                fields["assignee"] = get_values(actor, "name")
-                if labels:
-                    for label in labels:
-                        if fields["assignee"]["name"] in labels[label]:
-                            fields["labels"].append(label)
-                task_fields.append(fields)
-    else:
-        for assignee in assignees:
+    for assignee in assignees:
+        summary_prefix = [prefix for prefix in prefixes
+                          if prefixes[prefix][0] == assignee]
+        fields = copy.deepcopy(epic_flds.copy())
+        fields["assignee"] = {"name": assignee}
+        if labels:
+            for label in labels:
+                if assignee in labels[label]:
+                    fields["labels"].append(label)
+        if prefixes:
+            summary = fields["summary"]
+            for prefix in summary_prefix:
+                fields = copy.deepcopy(fields.copy())
+                fields["summary"] = "[%s] %s" % (prefix, summary)
+                if fields["summary"] not in existing:
+                    task_fields.append(fields)
+        else:
             if assignee not in existing:
-                fields = copy.deepcopy(epic_flds.copy())
-                fields["assignee"] = {"name": assignee}
-                if labels:
-                    for label in labels:
-                        if assignee in labels[label]:
-                            fields["labels"].append(label)
                 task_fields.append(fields)
+
     success = 0
     error = 0
     existing = len(existing)
@@ -211,17 +251,16 @@ def copy_epic_to_task(jira_instance, project_id, epic_id, copy_to_role,
 
 
 def find_current_sprint_id(sprints, sprint_name):
-    sprint_id = None
+    latest_sprint = None
 
     for sprint in sprints:
         # Split the sprint string into name and number then trim whitespace
         split = [token.strip() for token in sprint.name.split('#')]
         if sprint_name == split[0]:
-            sprint_id = sprint.id
+            latest_sprint = sprint
 
-    print('Current sprint:')
-    print(sprint_id)
-    return sprint_id
+    print("Current sprint {} (id: {})".format(latest_sprint.name, latest_sprint.id))
+    return latest_sprint.id
 
 
 # This should probably have different logic allowing for a different token to
@@ -241,26 +280,22 @@ def find_new_sprint_name(sprints, sprint_name):
 
 
 def find_next_sprint_id(sprints, sprint_name):
-    sprint_id = None
+    next_sprint = None
     sprint_number = None
 
     for sprint in sprints:
         # Split the sprint string into name and number then trim whitespace
         split = [token.strip() for token in sprint.name.split('#')]
-        print("SPLIT LAST")
-        print(split)
-        print(split[-1])
         split_sprint_number = int(split[-1])
         if sprint_name == split[0]:
             # Find the lowest sprint number in the list and its id
             if (sprint_number is None) or \
                     (split_sprint_number < sprint_number):
                 sprint_number = split_sprint_number
-                sprint_id = sprint.id
+                next_sprint = sprint
 
-    print('Next sprint:')
-    print(sprint_id)
-    return sprint_id
+    print('Next sprint: {} (id: {})'.format(next_sprint.name, next_sprint.id))
+    return next_sprint.id
 
 
 def get_current_sprints(jira_instance, board_id):
@@ -332,7 +367,7 @@ def report(jira_instance, sprint_name, board, template, output):
     report = []
     current_sprints = get_current_sprints(jira_instance, board)
     sprint_id = find_current_sprint_id(current_sprints, sprint_name)
-    issues = jira_instance.search_issues(f"sprint={sprint_id}",
+    issues = jira_instance.search_issues("sprint={sprint_id}",
                                          expand="changelog")
     for issue in issues:
         issue_data = jira2dict(issue)
@@ -375,6 +410,20 @@ def report(jira_instance, sprint_name, board, template, output):
         file_.write(template.render(data=report))
 
 
+def can_sprint_roll_over(active_sprint):
+    """
+    Sprints are typically two weeks intervals.
+    Check to see if we can
+    """
+    current_date = datetime.now().isoformat().split('T')[0]
+    print("Current Date: %s" % current_date)
+    end_date = active_sprint.endDate.split('T')[0]
+    print("Sprint End Date: %s" % end_date)
+
+    if current_date >= end_date:
+        return True
+
+    return False
 
 def parse_args():
     parser = argparse.ArgumentParser(usage='sprint-tool [OPTIONS]')
@@ -427,6 +476,16 @@ def parse_args():
                         type=str,
                         dest='jira_password',
                         help='User password for Jira login')
+    parser.add_argument('--summary-prefix',
+                        type=lambda prefixdict: ast.literal_eval(prefixdict),
+                        action='store',
+                        dest='prefixes',
+                        help="""
+                             Add prefixes to tickets of specific
+                             users. This is a dictionary, same format as
+                             labels. It is added to the title within brackets
+                             (e.g. [prefix]). Prefixes are unique, so there
+                             can be only one assignee per prefix""")
     parser.add_argument('--role',
                         action='store',
                         type=str,
@@ -507,6 +566,11 @@ def parse_args():
                         default='report.html',
                         type=str,
                         help='Report output path')
+    parser.add_argument('--force',
+                        action='store_true',
+                        dest='force',
+                        help="""To force an action. Typically used with --roll-sprint
+                        to force sprint roll over if it's before the end sprint date.""")
     args = parser.parse_args()
 
     return args
